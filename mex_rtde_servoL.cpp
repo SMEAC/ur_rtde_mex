@@ -5,15 +5,13 @@
  * Inputs: 1x6 <Double> TCPPose Target  (X,Y,Z,RX,RY,RZ)
  *         1x1 <Double> Lookahead in Range [0.03, 0.2]
  *         1x1 >Double> Gain - Servo Gain in Range [100, 2000]
- * Outputs: 1x6 <Double> TCPPose Actual  (X,Y,Z,RX,RY,RZ)
- *          1x6 <Double> Q Actual  (Q1, Q2, Q3, Q4, Q5, Q6)
+ * Outputs: 1x1 <Double> Status of Connection to Robot 
+ *
  * Parameters:
- *      <Double> Speed of Robot
- *      <Double> Accel of Robot
  *      <Double> Sample Time of s-Function
  *      string IP Address of Robot
  *
- *      Example Parameter List:     3 5 0.05 '192.168.255.128'
+ *      Example Parameter List:     0.008 '192.168.255.128'
  *
  * Simulink Coder note:
  *   This file needs to be compiled against the ur-rtde and boost libraries
@@ -61,75 +59,33 @@
 
 #include "simstruc.h"
 #include <ur_rtde/rtde_control_interface.h>
-#include <ur_rtde/rtde_receive_interface.h>
 
-
-#define SPEED_IDX  0
-#define SPEED_PARAM(S) ssGetSFcnParam(S,SPEED_IDX)
-
-#define ACCEL_IDX   1
-#define ACCEL_PARAM(S) ssGetSFcnParam(S,ACCEL_IDX)
-
-#define TIME_IDX   2
+#define TIME_IDX   0
 #define TIME_PARAM(S) ssGetSFcnParam(S,TIME_IDX)
 
-#define IP_IDX   3
+#define IP_IDX   1
 #define IP_PARAM(S) ssGetSFcnParam(S,IP_IDX)
 
-#define NPARAMS   4
+#define NPARAMS   2
 
 #define IS_PARAM_DOUBLE(pVal) (mxIsNumeric(pVal) && !mxIsLogical(pVal) &&\
 !mxIsEmpty(pVal) && !mxIsSparse(pVal) && !mxIsComplex(pVal) && mxIsDouble(pVal))
 
 #include <thread>
-#include <chrono>
 
 using namespace ur_rtde;
-using namespace std::chrono;
 
-ur_rtde::RTDEReceiveInterface *rtde_receive;
 ur_rtde::RTDEControlInterface *rtde_control;
 int isInitialised = 0;
-std::vector<double> tcpPose;
-std::vector<double> q;
-auto t_start = high_resolution_clock::now();
-auto t_stop = high_resolution_clock::now();
-// Parameters
+std::vector<double> tcpPose(6,0.0);
+
 char_T ip_addr[sizeof("255.255.255.255")];
 
 /*================*
  * Build checking *
  *================*/
 
-#define MDL_CHECK_PARAMETERS
-#if defined(MDL_CHECK_PARAMETERS)  && defined(MATLAB_MEX_FILE)
-/*
- * Check to make sure that each parameter is 1-d and positive
- */
-static void mdlCheckParameters(SimStruct *S)
-{
-      /* Check second parameter: gain to be applied to the sum */
-      {
-          if (!mxIsDouble(SPEED_PARAM(S)) ||
-              mxGetNumberOfElements(SPEED_PARAM(S)) != 1) {
-              ssSetErrorStatus(S,"Second parameter to S-function must be a "
-                               "scalar \"gain\" value to be applied to "
-                               "the sum of the inputs");
-              return;
-          }
-      }
-      /* Check second parameter: gain to be applied to the sum */
-      {
-          if (!mxIsDouble(ACCEL_PARAM(S)) ||
-              mxGetNumberOfElements(ACCEL_PARAM(S)) != 1) {
-              ssSetErrorStatus(S,"Second parameter to S-function must be a "
-                               "scalar \"gain\" value to be applied to "
-                               "the sum of the inputs");
-              return;
-          }
-      }    
-}
-#endif
+
 
 /* Function: mdlInitializeSizes ===============================================
  * Abstract:
@@ -155,18 +111,21 @@ static void mdlInitializeSizes(SimStruct *S)
       }
 
 
-    if (!ssSetNumInputPorts(S, 3)) return;
+    if (!ssSetNumInputPorts(S, 5)) return;
     ssSetInputPortWidth(S, 0, 6);
-    ssSetInputPortDirectFeedThrough(S, 0, 1);
     ssSetInputPortWidth(S, 1, 1);
     ssSetInputPortWidth(S, 2, 1);
+    ssSetInputPortWidth(S, 3, 1);
+    ssSetInputPortWidth(S, 4, 1);
+
+    ssSetInputPortDirectFeedThrough(S, 0, 1);
     ssSetInputPortDirectFeedThrough(S, 1, 1);
     ssSetInputPortDirectFeedThrough(S, 2, 1);
+    ssSetInputPortDirectFeedThrough(S, 3, 1);
+    ssSetInputPortDirectFeedThrough(S, 4, 1);
 
-    if (!ssSetNumOutputPorts(S,3)) return;
-    ssSetOutputPortWidth(S, 0, 6);
-    ssSetOutputPortWidth(S, 1, 6);
-    ssSetOutputPortWidth(S, 2, 2);
+    if (!ssSetNumOutputPorts(S,1)) return;
+    ssSetOutputPortWidth(S, 0, 1);
 
     ssSetNumSampleTimes(S, 1);
 
@@ -177,7 +136,6 @@ static void mdlInitializeSizes(SimStruct *S)
                  SS_OPTION_WORKS_WITH_CODE_REUSE |
                  SS_OPTION_EXCEPTION_FREE_CODE |
                  SS_OPTION_USE_TLC_WITH_ACCELERATOR);
-    rtde_receive = NULL;
     rtde_control = NULL;
 }
 
@@ -191,70 +149,9 @@ static void mdlInitializeSampleTimes(SimStruct* S)
     ssSetSampleTime(S, 0, mxGetDoubles(TIME_PARAM(S))[0]);
     ssSetOffsetTime(S, 0, 0.0);
     ssSetModelReferenceSampleTimeDefaultInheritance(S);
-    rtde_receive = NULL;
     rtde_control = NULL;
 }
 
-
-#define MDL_SET_WORK_WIDTHS   /* Change to #undef to remove function */
-#if defined(MDL_SET_WORK_WIDTHS) && defined(MATLAB_MEX_FILE)
-/* Function: mdlSetWorkWidths ===============================================
- * Abstract:
- *      Set up run-time parameters.
- */
-static void mdlSetWorkWidths(SimStruct *S)
-{
-    ssParamRec p;
-    int        dlgP = SPEED_IDX;
-
-    p.name             = "Speed";
-    p.nDimensions      = 1;
-    p.dimensions       = (int_T *) mxGetDimensions(SPEED_PARAM(S));
-    p.dataTypeId       = SS_DOUBLE;
-    p.complexSignal    = COMPLEX_NO;
-    p.data             = (void *)mxGetPr(SPEED_PARAM(S));
-    p.dataAttributes   = NULL;
-    p.nDlgParamIndices = 1;
-    p.dlgParamIndices  = &dlgP;
-    p.transformed      = RTPARAM_NOT_TRANSFORMED;
-    p.outputAsMatrix   = false;   
-
-    ssParamRec m;
-    int        dlgM = ACCEL_IDX;
-
-    m.name             = "Accel";
-    m.nDimensions      = 1;
-    m.dimensions       = (int_T *) mxGetDimensions(ACCEL_PARAM(S));
-    m.dataTypeId       = SS_DOUBLE;
-    m.complexSignal    = COMPLEX_NO;
-    m.data             = (void *)mxGetPr(ACCEL_PARAM(S));
-    m.dataAttributes   = NULL;
-    m.nDlgParamIndices = 1;
-    m.dlgParamIndices  = &dlgM;
-    m.transformed      = RTPARAM_NOT_TRANSFORMED;
-    m.outputAsMatrix   = false;       
-    
-    if (!ssSetNumRunTimeParams(S, 2)) return;
-
-    if (!ssSetRunTimeParamInfo(S, 0, &p)) return;
-    if (!ssSetRunTimeParamInfo(S, 1, &m)) return;
-}
-#endif /* MDL_SET_WORK_WIDTHS */
-
-
-#define MDL_PROCESS_PARAMETERS   /* Change to #undef to remove function */
-#if defined(MDL_PROCESS_PARAMETERS) && defined(MATLAB_MEX_FILE)
-/* Function: mdlProcessParameters ===========================================
- * Abstract:
- *      Update run-time parameters.
- */
-static void mdlProcessParameters(SimStruct *S)
-{
-    /* Update Run-Time parameters */
-    ssUpdateRunTimeParamData(S, 0, mxGetPr(SPEED_PARAM(S)));
-    ssUpdateRunTimeParamData(S, 1, mxGetPr(ACCEL_PARAM(S)));
-}
-#endif /* MDL_PROCESS_PARAMETERS */
 
 
 
@@ -264,50 +161,60 @@ static void mdlProcessParameters(SimStruct *S)
  */
 static void mdlOutputs(SimStruct *S, int_T tid)
 {
-    t_start = high_resolution_clock::now();
-    auto duration2 = std::chrono::duration<double>(t_start - t_stop);
-    if (isInitialised == 0 || rtde_receive == NULL || rtde_control == NULL)
+    if (isInitialised == 0 || rtde_control == NULL)
     {
-        mexPrintf("Initialising\nConnecting to: ");
+        mexPrintf("Connecting Controller to: ");
         mexPrintf(ip_addr);
+        mexPrintf("\n");
+        try
+        {
+            rtde_control = new ur_rtde::RTDEControlInterface(ip_addr);
+            isInitialised = 1;
+        }
+        catch (const std::exception& e)
+        {
+            mexPrintf(e.what());
+            mexPrintf("\n");
+            isInitialised = 0;
+        }
+    }
+    if (isInitialised == 1 && rtde_control != NULL)
+    {
 
-        rtde_receive = new ur_rtde::RTDEReceiveInterface(ip_addr);
-        rtde_control = new ur_rtde::RTDEControlInterface(ip_addr);
+
+    
+    try
+    {
+        int_T             i;
+        InputRealPtrsType targetPoseInPtr = ssGetInputPortRealSignalPtrs(S,0);
+        InputRealPtrsType LookaheadInPtr  = ssGetInputPortRealSignalPtrs(S,1);
+        InputRealPtrsType GainInPtr       = ssGetInputPortRealSignalPtrs(S,2);
+        InputRealPtrsType SpeedInPtr      = ssGetInputPortRealSignalPtrs(S,3);
+        InputRealPtrsType AccelInPtr      = ssGetInputPortRealSignalPtrs(S,4);
+ 
+        for (i=0; i<tcpPose.size(); i++) {
+             tcpPose[i] = (*targetPoseInPtr[i]);
+        }        
+        real_T blockingTime  = 0.5*mxGetDoubles(TIME_PARAM(S))[0];
+        real_T gain = *GainInPtr[0];
+        real_T lookahead = *LookaheadInPtr[0];
+        real_T speed = *SpeedInPtr[0];
+        real_T accel = *AccelInPtr[0];        
+        rtde_control->servoL(tcpPose, speed, accel, blockingTime, lookahead, gain);
+
         
-        isInitialised = 1;
+        
     }
-    int_T             i;
-    InputRealPtrsType targetPoseInPtr = ssGetInputPortRealSignalPtrs(S,0);
-    InputRealPtrsType LookaheadInPtr = ssGetInputPortRealSignalPtrs(S,1);
-    InputRealPtrsType GainInPtr = ssGetInputPortRealSignalPtrs(S,2);
-    real_T            *tcpPoseOutPtr    = ssGetOutputPortRealSignal(S,0);
-    
-    real_T            *qActualOutPtr    = ssGetOutputPortRealSignal(S,1);
-    real_T            *timeInfoOutPtr    = ssGetOutputPortRealSignal(S,2);
-    real_T speed         = *((real_T *)((ssGetRunTimeParamInfo(S,SPEED_IDX))->data));
-    real_T accel         = *((real_T *)((ssGetRunTimeParamInfo(S,ACCEL_IDX))->data));
-    real_T blockingTime  = mxGetDoubles(TIME_PARAM(S))[0];
-
-	
-    real_T gain = *GainInPtr[0];
-    real_T lookahead = *LookaheadInPtr[0];
-
-	tcpPose = rtde_receive->getTargetTCPPose();
-    q = rtde_receive->getActualQ();
-
-    for (i=0; i<6; i++) {
-        *tcpPoseOutPtr++ = tcpPose[i];
-        *qActualOutPtr++ = q[i];
-        tcpPose[i] = (*targetPoseInPtr[i]);
-    }
-
-
-    rtde_control->servoL(tcpPose, speed, accel, blockingTime, lookahead, gain);
-    t_stop = high_resolution_clock::now();
-    auto duration = std::chrono::duration<double>(t_stop - t_start);
-    *timeInfoOutPtr++ = gain;
-    *timeInfoOutPtr = lookahead;
-    
+    catch (const std::exception& e)
+    {
+        
+         mexPrintf(e.what());
+         mexPrintf("\n");
+         isInitialised = 0;
+    }    
+    }    
+    real_T     *connectStateOutPtr    = ssGetOutputPortRealSignal(S,0);
+    *connectStateOutPtr = isInitialised;
 }
 
 
@@ -317,10 +224,21 @@ static void mdlOutputs(SimStruct *S, int_T tid)
  */
 static void mdlTerminate(SimStruct *S)
 {
-    delete rtde_receive;
-    delete rtde_control;
+    try
+    {
+        if (isInitialised == 1 && rtde_control != NULL)
+        {
+            rtde_control->servoStop(10.0);
+            delete rtde_control;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        mexPrintf(e.what());
+        mexPrintf("\n");
+        isInitialised = 0;
+    }
     isInitialised = 0;
-    rtde_receive = NULL;
 }
 
 
